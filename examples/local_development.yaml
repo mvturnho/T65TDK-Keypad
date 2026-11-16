@@ -1,0 +1,28 @@
+esphome:
+  name: t65-keypad-local
+  friendly_name: T65 Keypad Local Development
+  min_version: 2026.10.2
+
+esp32:
+  board: esp32dev
+  framework:
+    type: esp-idf
+
+external_components:
+  - source:
+      type: local
+      path: ../components
+    components: [t65_keypad]
+    refresh: 0s
+
+logger:
+  level: VERY_VERBOSE
+
+t65_keypad:
+  id: t65
+  rows: [GPIO19, GPIO21, GPIO22, GPIO23]
+  columns: [GPIO16, GPIO17, GPIO18]
+  debounce: 20ms
+  on_key:
+    - lambda: |-
+        ESP_LOGI("t65", "Local button: %c", x);

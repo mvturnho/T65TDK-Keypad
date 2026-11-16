@@ -1,0 +1,51 @@
+esphome:
+  name: t65-keypad
+  friendly_name: T65 Keypad
+  min_version: 2026.10.2
+
+esp32:
+  board: esp32dev
+  framework:
+    type: esp-idf
+
+external_components:
+  - source:
+      type: local
+      path: ../components
+    components: [t65_keypad]
+
+logger:
+
+api:
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+t65_keypad:
+  id: t65
+  rows:
+    - GPIO19
+    - GPIO21
+    - GPIO22
+    - GPIO23
+  columns:
+    - GPIO16
+    - GPIO17
+    - GPIO18
+  debounce: 20ms
+  on_key:
+    - lambda: |-
+        ESP_LOGI("t65", "Pressed: %c", x);
+  on_key_release:
+    - lambda: |-
+        ESP_LOGI("t65", "Released: %c", x);
+
+event:
+  - platform: t65_keypad
+    keypad_id: t65
+    name: T65 Keypad

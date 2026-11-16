@@ -1,0 +1,15 @@
+# Home Assistant automation (not an ESPHome device configuration).
+automation:
+  - alias: T65 keypad key 1
+    id: t65_keypad_key_1
+    mode: queued
+    triggers:
+      - trigger: state
+        entity_id: event.t65_keypad
+    conditions:
+      - condition: template
+        value_template: "{{ trigger.to_state.attributes.event_type == 'key_1' }}"
+    actions:
+      - action: light.toggle
+        target:
+          entity_id: light.hall

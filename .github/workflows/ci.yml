@@ -1,0 +1,62 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  ESPHOME_VERSION: 2026.10.2
+
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+      - name: Install validation tools
+        run: pip install "esphome==$ESPHOME_VERSION" pytest ruff PyYAML
+      - name: Lint Python
+        run: ruff check components tests
+      - name: Run Python and ESPHome schema tests
+        run: pytest -q
+      - name: Build native state-machine tests
+        run: |
+          cmake -S tests -B build/tests -DCMAKE_BUILD_TYPE=Debug
+          cmake --build build/tests --parallel
+          ctest --test-dir build/tests --output-on-failure
+      - name: Validate example configurations
+        run: |
+          cp examples/secrets.yaml.example examples/secrets.yaml
+          esphome config examples/esp32.yaml
+          esphome config examples/esp32_s3.yaml
+          esphome config examples/esp32_arduino.yaml
+          esphome config examples/local_development.yaml
+
+  firmware:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        example: [esp32, esp32_s3, esp32_arduino]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/esphome
+          key: esphome-${{ runner.os }}-${{ env.ESPHOME_VERSION }}-${{ matrix.example }}
+      - name: Install ESPHome
+        run: pip install "esphome==$ESPHOME_VERSION"
+      - name: Compile firmware
+        run: |
+          cp examples/secrets.yaml.example examples/secrets.yaml
+          esphome compile "examples/${{ matrix.example }}.yaml"

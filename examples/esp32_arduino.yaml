@@ -1,0 +1,25 @@
+esphome:
+  name: t65-keypad-arduino
+  friendly_name: T65 Keypad Arduino
+  min_version: 2026.10.2
+
+esp32:
+  board: esp32dev
+  framework:
+    type: arduino
+
+external_components:
+  - source:
+      type: local
+      path: ../components
+    components: [t65_keypad]
+
+logger:
+
+t65_keypad:
+  id: t65_arduino
+  rows: [GPIO19, GPIO21, GPIO22, GPIO23]
+  columns: [GPIO16, GPIO17, GPIO18]
+  on_key:
+    - lambda: |-
+        ESP_LOGI("t65", "Pressed: %c", x);
