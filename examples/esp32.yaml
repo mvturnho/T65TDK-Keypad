@@ -38,12 +38,20 @@ t65_keypad:
     - GPIO17
     - GPIO18
   debounce: 20ms
+  long_press_time: 1s
   on_key:
     - lambda: |-
         ESP_LOGI("t65", "Pressed: %c", x);
   on_key_release:
     - lambda: |-
         ESP_LOGI("t65", "Released: %c", x);
+  on_key_long_press:
+    - lambda: |-
+        ESP_LOGI("t65", "Long press: %c", x);
+  repeat_time: 250ms
+  on_key_repeat:
+    - lambda: |-
+        ESP_LOGI("t65", "Repeat: %c", x);
 
 event:
   - platform: t65_keypad

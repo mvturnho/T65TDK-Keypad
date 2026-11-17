@@ -37,13 +37,14 @@ jobs:
           esphome config examples/esp32_s3.yaml
           esphome config examples/esp32_arduino.yaml
           esphome config examples/local_development.yaml
+          esphome config examples/rotary_dial_replacement.yaml
 
   firmware:
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        example: [esp32, esp32_s3, esp32_arduino]
+        example: [esp32, esp32_s3, esp32_arduino, rotary_dial_replacement]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5

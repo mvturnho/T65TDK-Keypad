@@ -1,0 +1,101 @@
+# A PTT T65 telephone in which the T65-TDK keypad replaces the rotarydial
+# component. The dial sensor, the numbers text sensor and the clear action
+# behave as they did with the rotary dial, so Home Assistant needs no changes.
+# See docs/rotary_dial_migration.md for the line-by-line migration.
+substitutions:
+  devicename: PTT-T65
+
+# No friendly_name, like the original rotary dial configuration: adding one
+# would change how Home Assistant names the existing entities.
+esphome:
+  name: ptt-t65
+  min_version: 2026.10.2
+
+esp32:
+  board: esp32dev
+  framework:
+    type: esp-idf
+
+external_components:
+  - source:
+      type: local
+      path: ../components
+    components: [t65_keypad]
+
+logger:
+
+api:
+  actions:
+    - action: clear_number
+      then:
+        - t65_keypad.clear_numbers: t65
+        - text_sensor.template.publish:
+            id: numbers
+            state: "Pickup"
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+# Replaces "sensor: - platform: rotarydial". GPIO16 and GPIO17 were the rotary
+# dial's trigger and pulse pins; GPIO32 is used for C3 because GPIO18 drives an
+# LED in the original telephone configuration.
+t65_keypad:
+  id: t65
+  rows: [GPIO19, GPIO21, GPIO22, GPIO23]
+  columns: [GPIO16, GPIO17, GPIO32]
+  timeout: 4s
+  # Optional extras on top of the rotary dial behavior. A key held for 1s runs
+  # on_key_long_press, and while it stays held on_key_repeat every 250ms. Long
+  # presses and repeats are left out of the dial sensor and on_numbers, so
+  # normal dialing reaches Home Assistant exactly as before.
+  long_press_time: 1s
+  on_key_long_press:
+    - lambda: |-
+        ESP_LOGI("t65", "Long press: %c", x);
+  repeat_time: 250ms
+  on_key_repeat:
+    - lambda: |-
+        ESP_LOGI("t65", "Repeat: %c", x);
+  on_numbers:
+    then:
+      - if:
+          condition:
+            wifi.connected:
+          then:
+            - text_sensor.template.publish:
+                id: numbers
+                state: !lambda "return x;"
+
+sensor:
+  - platform: t65_keypad
+    keypad_id: t65
+    id: dial
+    # Keep the rotary dial sensor's name so Home Assistant keeps the entity.
+    name: ${devicename} Dial
+
+text_sensor:
+  - platform: template
+    id: numbers
+    name: ${devicename} numbers
+
+binary_sensor:
+  - platform: gpio
+    id: pickup
+    name: ${devicename}_pickup
+    pin: GPIO35
+    on_press:
+      then:
+        - text_sensor.template.publish:
+            id: numbers
+            state: "Pickup"
+    on_release:
+      then:
+        - t65_keypad.clear_numbers: t65
+        - text_sensor.template.publish:
+            id: numbers
+            state: "Hangup"

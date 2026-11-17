@@ -9,11 +9,13 @@ def test_external_component_layout() -> None:
     required = [
         "components/t65_keypad/__init__.py",
         "components/t65_keypad/event.py",
+        "components/t65_keypad/sensor.py",
         "components/t65_keypad/t65_keypad.h",
         "components/t65_keypad/t65_keypad.cpp",
         "components/t65_keypad/t65_keypad_state.h",
         "examples/esp32.yaml",
         "examples/esp32_s3.yaml",
+        "examples/rotary_dial_replacement.yaml",
         "README.md",
         "LICENSE",
     ]

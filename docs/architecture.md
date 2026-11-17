@@ -66,9 +66,44 @@ advertises a fixed list of 12 event types. It is triggered only from normal
 context on a new press. Callback vectors allocate only during setup; there are
 no per-key dynamic buffers.
 
+## Number collection, long press and repeat
+
+`T65Dialer` turns accepted presses and releases into the collected number,
+long presses and repeats. Like the debounce state machine it is independent of
+ESPHome and covered by the native tests. It keeps the number in a fixed
+33-byte buffer (`T65NumberBuffer`, 32 keys plus terminator) and returns a
+small result for each input: the key to collect, the key that became a long
+press or repeated, and whether to start or stop the number, long-press and
+repeat timeouts. The component applies that result.
+
+Without long press, a press is collected at once. With long press, a press
+starts the long-press timeout and pauses a pending number report; the release
+(short) or the timeout (long) then classifies the key. A lockout cancels the
+long-press timeout. A `report pending` flag ensures a long press resumes only
+a report that has not run yet.
+
+With repeat, the long press starts the repeat timeout, and every repeat
+re-arms it. Release and lockout stop it. A re-armed timeout is used instead of
+`set_interval()`, because the scheduler delays an interval's first run by a
+random offset of up to half its period.
+
+All waits are named ESPHome scheduler timeouts. The scheduler runs them even
+while the component loop is disabled, so a held key or a pending number does
+not re-enable polling. The component applies timer requests before it runs
+automations, so a `clear_numbers()` from an automation always wins over a
+report started by the same input. When the number timeout fires, the buffer is
+copied once into the `std::string` passed to `on_numbers`; the buffer itself
+keeps its contents until `clear_numbers()`.
+
+The dial sensor and the Event entity are published for collected keys, long
+presses and repeats from the same normal-context path; `on_key` and `on_key_release`
+remain raw press and release callbacks.
+
 ## Failure handling and diagnostics
 
 Python validation catches count, duplicate, mode, capability and debounce
 errors before C++ generation. Runtime invalid combinations never decode to a
-key. INFO logs contain accepted transitions; DEBUG contains stable masks and
-lockout transitions; VERY_VERBOSE contains edge snapshots. No ISR logs exist.
+key. INFO logs contain accepted transitions, long presses and reported
+numbers; DEBUG contains stable masks, lockout transitions, repeats and clears; VERY_VERBOSE contains
+edge snapshots. A full number buffer is logged as a WARNING. No ISR logs
+exist.

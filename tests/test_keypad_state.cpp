@@ -4,9 +4,14 @@
 
 #include "t65_keypad_state.h"
 
+using esphome::t65_keypad::T65_MAX_NUMBER_LENGTH;
 using esphome::t65_keypad::T65ContactSample;
+using esphome::t65_keypad::T65Dialer;
+using esphome::t65_keypad::T65DialResult;
 using esphome::t65_keypad::T65KeypadStateMachine;
+using esphome::t65_keypad::T65NumberBuffer;
 using esphome::t65_keypad::T65State;
+using esphome::t65_keypad::T65TimerRequest;
 using esphome::t65_keypad::T65Transition;
 
 namespace {
@@ -160,6 +165,288 @@ void test_interrupt_during_loop_disable_handshake() {
   CHECK(T65KeypadStateMachine::has_unprocessed_edges(0xFFFFFFFFU, 0));
 }
 
+void test_number_buffer_collects_until_cleared() {
+  T65NumberBuffer number;
+  CHECK(number.empty());
+  CHECK(std::string(number.c_str()).empty());
+
+  for (char key : std::string("0612345678"))
+    CHECK(number.append(key));
+  CHECK(std::string(number.c_str()) == "0612345678");
+  CHECK(number.size() == 10);
+
+  // Like the rotarydial component, reporting does not clear: later keys append.
+  CHECK(number.append('*'));
+  CHECK(number.append('#'));
+  CHECK(std::string(number.c_str()) == "0612345678*#");
+
+  number.clear();
+  CHECK(number.empty());
+  CHECK(std::string(number.c_str()).empty());
+  CHECK(number.append('9'));
+  CHECK(std::string(number.c_str()) == "9");
+}
+
+void test_number_buffer_is_bounded() {
+  T65NumberBuffer number;
+  for (size_t i = 0; i < T65_MAX_NUMBER_LENGTH; i++)
+    CHECK(number.append(static_cast<char>('0' + i % 10)));
+  CHECK(number.size() == T65_MAX_NUMBER_LENGTH);
+
+  const std::string full = number.c_str();
+  CHECK(full.size() == T65_MAX_NUMBER_LENGTH);
+  CHECK(!number.append('#'));
+  CHECK(std::string(number.c_str()) == full);
+
+  number.clear();
+  CHECK(number.append('1'));
+}
+
+void test_digit_values() {
+  constexpr char digits[] = "0123456789";
+  for (int value = 0; value < 10; value++)
+    CHECK(T65NumberBuffer::digit_value(digits[value]) == value);
+  CHECK(T65NumberBuffer::digit_value('*') == -1);
+  CHECK(T65NumberBuffer::digit_value('#') == -1);
+  CHECK(T65NumberBuffer::digit_value(0) == -1);
+}
+
+constexpr T65TimerRequest KEEP = T65TimerRequest::KEEP;
+constexpr T65TimerRequest START = T65TimerRequest::START;
+constexpr T65TimerRequest STOP = T65TimerRequest::STOP;
+
+std::string number(const T65Dialer &dialer) { return dialer.number().c_str(); }
+
+void test_dialer_without_long_press_collects_on_press() {
+  T65Dialer dialer;
+  T65DialResult result = dialer.press('5');
+  CHECK(result.collected == '5');
+  CHECK(result.long_press == 0);
+  CHECK(result.report_timer == START);
+  CHECK(result.long_press_timer == KEEP);
+  CHECK(number(dialer) == "5");
+
+  // Release changes nothing, exactly as before long press existed.
+  result = dialer.release('5');
+  CHECK(result.collected == 0);
+  CHECK(result.report_timer == KEEP);
+  CHECK(result.long_press_timer == KEEP);
+
+  // Holding has no effect either; a stray long-press timeout is ignored.
+  CHECK(dialer.press('6').collected == '6');
+  CHECK(dialer.long_press_elapsed().long_press == 0);
+  CHECK(number(dialer) == "56");
+}
+
+void test_dialer_short_press_collects_on_release() {
+  T65Dialer dialer;
+  dialer.set_long_press_enabled(true);
+
+  T65DialResult result = dialer.press('1');
+  CHECK(result.collected == 0);
+  CHECK(result.long_press_timer == START);
+  CHECK(result.report_timer == KEEP);  // Nothing pending yet.
+  CHECK(number(dialer).empty());
+
+  result = dialer.release('1');
+  CHECK(result.collected == '1');
+  CHECK(result.long_press == 0);
+  CHECK(result.long_press_timer == STOP);
+  CHECK(result.report_timer == START);
+  CHECK(number(dialer) == "1");
+
+  // A timeout that fires after the release must not turn it into a long press.
+  CHECK(dialer.long_press_elapsed().long_press == 0);
+}
+
+void test_dialer_long_press_is_not_collected() {
+  T65Dialer dialer;
+  dialer.set_long_press_enabled(true);
+
+  dialer.press('0');
+  dialer.release('0');
+  dialer.press('6');
+  dialer.release('6');
+  CHECK(number(dialer) == "06");
+  CHECK(dialer.report_pending());
+
+  // The pending report waits while a key is held.
+  T65DialResult result = dialer.press('#');
+  CHECK(result.report_timer == STOP);
+
+  result = dialer.long_press_elapsed();
+  CHECK(result.long_press == '#');
+  CHECK(result.collected == 0);
+  CHECK(result.report_timer == START);  // The paused report resumes.
+  CHECK(result.long_press_timer == KEEP);
+
+  // Fires only once per hold, and the release does not add the key.
+  CHECK(dialer.long_press_elapsed().long_press == 0);
+  result = dialer.release('#');
+  CHECK(result.collected == 0);
+  CHECK(result.report_timer == KEEP);
+  CHECK(result.long_press_timer == KEEP);
+  CHECK(number(dialer) == "06");
+}
+
+void test_dialer_long_press_does_not_repeat_report() {
+  T65Dialer dialer;
+  dialer.set_long_press_enabled(true);
+  dialer.press('1');
+  dialer.release('1');
+  dialer.reported();
+  CHECK(!dialer.report_pending());
+
+  // Nothing is pending, so neither the hold nor the long press restarts it.
+  CHECK(dialer.press('2').report_timer == KEEP);
+  T65DialResult result = dialer.long_press_elapsed();
+  CHECK(result.long_press == '2');
+  CHECK(result.report_timer == KEEP);
+  CHECK(dialer.release('2').report_timer == KEEP);
+  CHECK(number(dialer) == "1");
+}
+
+void test_dialer_lockout_cancels_long_press() {
+  T65Dialer dialer;
+  dialer.set_long_press_enabled(true);
+  dialer.press('4');
+
+  T65DialResult result = dialer.lockout();
+  CHECK(result.long_press_timer == STOP);
+  CHECK(dialer.long_press_elapsed().long_press == 0);
+
+  // The release from lockout counts as a short press, as the press would have
+  // been collected immediately without long press.
+  result = dialer.release('4');
+  CHECK(result.collected == '4');
+  CHECK(result.long_press_timer == KEEP);
+  CHECK(result.report_timer == START);
+
+  // Lockout without a held key, for example at boot, does nothing.
+  result = dialer.lockout();
+  CHECK(result.long_press_timer == KEEP);
+  CHECK(dialer.release('4').collected == 0);
+}
+
+void test_dialer_clear() {
+  T65Dialer dialer;
+  dialer.set_long_press_enabled(true);
+  dialer.press('7');
+  dialer.release('7');
+
+  dialer.press('*');
+  T65DialResult result = dialer.clear();
+  CHECK(result.report_timer == STOP);
+  CHECK(result.long_press_timer == KEEP);  // The held key is unaffected.
+  CHECK(number(dialer).empty());
+  CHECK(!dialer.report_pending());
+
+  // A long press after clearing does not report the now empty number.
+  result = dialer.long_press_elapsed();
+  CHECK(result.long_press == '*');
+  CHECK(result.report_timer == KEEP);
+}
+
+void test_dialer_reports_dropped_keys() {
+  T65Dialer dialer;
+  for (size_t i = 0; i < T65_MAX_NUMBER_LENGTH; i++)
+    CHECK(!dialer.press('9').dropped);
+  T65DialResult result = dialer.press('8');
+  CHECK(result.collected == '8');
+  CHECK(result.dropped);
+  CHECK(result.report_timer == START);
+  CHECK(dialer.number().size() == T65_MAX_NUMBER_LENGTH);
+}
+
+T65Dialer repeating_dialer() {
+  T65Dialer dialer;
+  dialer.set_long_press_enabled(true);
+  dialer.set_repeat_enabled(true);
+  return dialer;
+}
+
+void test_dialer_repeats_after_long_press() {
+  T65Dialer dialer = repeating_dialer();
+  dialer.press('0');
+  dialer.release('0');
+
+  // Repeating only starts with the long press, not at the press itself.
+  T65DialResult result = dialer.press('5');
+  CHECK(result.repeat_timer == KEEP);
+  CHECK(dialer.repeat_elapsed().repeat == 0);
+
+  result = dialer.long_press_elapsed();
+  CHECK(result.long_press == '5');
+  CHECK(result.repeat == 0);
+  CHECK(result.repeat_timer == START);
+
+  for (int i = 0; i < 3; i++) {
+    result = dialer.repeat_elapsed();
+    CHECK(result.repeat == '5');
+    CHECK(result.repeat_timer == START);  // Re-armed for the next repeat.
+    CHECK(result.long_press == 0);
+    CHECK(result.collected == 0);
+    CHECK(result.report_timer == KEEP);
+  }
+
+  result = dialer.release('5');
+  CHECK(result.repeat_timer == STOP);
+  CHECK(result.long_press_timer == KEEP);
+  CHECK(result.collected == 0);
+  CHECK(dialer.repeat_elapsed().repeat == 0);
+  CHECK(number(dialer) == "0");
+}
+
+void test_dialer_short_press_does_not_repeat() {
+  T65Dialer dialer = repeating_dialer();
+  dialer.press('3');
+  T65DialResult result = dialer.release('3');
+  CHECK(result.collected == '3');
+  CHECK(result.repeat_timer == KEEP);
+  CHECK(dialer.repeat_elapsed().repeat == 0);
+
+  // The next press starts clean: no repeat before its own long press.
+  dialer.press('3');
+  CHECK(dialer.repeat_elapsed().repeat == 0);
+}
+
+void test_dialer_lockout_stops_repeat() {
+  T65Dialer dialer = repeating_dialer();
+  dialer.press('8');
+  dialer.long_press_elapsed();
+  CHECK(dialer.repeat_elapsed().repeat == '8');
+
+  T65DialResult result = dialer.lockout();
+  CHECK(result.repeat_timer == STOP);
+  CHECK(result.long_press_timer == KEEP);
+  CHECK(dialer.repeat_elapsed().repeat == 0);
+
+  // It was a long press, so the release from lockout collects nothing.
+  result = dialer.release('8');
+  CHECK(result.collected == 0);
+  CHECK(result.repeat_timer == KEEP);
+}
+
+void test_dialer_without_repeat_stops_at_long_press() {
+  T65Dialer dialer;
+  dialer.set_long_press_enabled(true);
+  dialer.press('9');
+  T65DialResult result = dialer.long_press_elapsed();
+  CHECK(result.long_press == '9');
+  CHECK(result.repeat_timer == KEEP);
+  CHECK(dialer.repeat_elapsed().repeat == 0);
+  CHECK(dialer.release('9').repeat_timer == KEEP);
+}
+
+void test_dialer_clear_keeps_repeating() {
+  T65Dialer dialer = repeating_dialer();
+  dialer.press('*');
+  dialer.long_press_elapsed();
+  T65DialResult result = dialer.clear();
+  CHECK(result.repeat_timer == KEEP);
+  CHECK(dialer.repeat_elapsed().repeat == '*');
+}
+
 }  // namespace
 
 int main() {
@@ -172,6 +459,21 @@ int main() {
   test_boot_held_key_is_suppressed();
   test_millis_wraparound();
   test_interrupt_during_loop_disable_handshake();
+  test_number_buffer_collects_until_cleared();
+  test_number_buffer_is_bounded();
+  test_digit_values();
+  test_dialer_without_long_press_collects_on_press();
+  test_dialer_short_press_collects_on_release();
+  test_dialer_long_press_is_not_collected();
+  test_dialer_long_press_does_not_repeat_report();
+  test_dialer_lockout_cancels_long_press();
+  test_dialer_clear();
+  test_dialer_reports_dropped_keys();
+  test_dialer_repeats_after_long_press();
+  test_dialer_short_press_does_not_repeat();
+  test_dialer_lockout_stops_repeat();
+  test_dialer_without_repeat_stops_at_long_press();
+  test_dialer_clear_keeps_repeating();
 
   if (failures != 0) {
     std::cerr << failures << " test assertion(s) failed\n";

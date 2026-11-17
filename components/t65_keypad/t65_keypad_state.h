@@ -1,10 +1,189 @@
 #pragma once
 
+#include <array>
+#include <cstddef>
 #include <cstdint>
 
 namespace esphome::t65_keypad {
 
 constexpr char T65_KEYS[] = "123456789*0#";
+
+// Longest number on_numbers can report. Generous for any phone number plus
+// service codes, while keeping the buffer a fixed size without per-key allocation.
+constexpr size_t T65_MAX_NUMBER_LENGTH = 32;
+
+// Collects pressed keys into the number reported by on_numbers. Like the
+// rotarydial component it replaces, keys keep accumulating after a number has
+// been reported; only clear() starts a new number.
+class T65NumberBuffer {
+ public:
+  // Returns false, leaving the buffer unchanged, when it is already full.
+  bool append(char key) {
+    if (this->length_ >= T65_MAX_NUMBER_LENGTH)
+      return false;
+    this->keys_[this->length_++] = key;
+    this->keys_[this->length_] = '\0';
+    return true;
+  }
+
+  void clear() {
+    this->length_ = 0;
+    this->keys_[0] = '\0';
+  }
+
+  const char *c_str() const { return this->keys_.data(); }
+  size_t size() const { return this->length_; }
+  bool empty() const { return this->length_ == 0; }
+
+  // Numeric value of a digit key, or -1 for '*' and '#'.
+  static int digit_value(char key) { return (key >= '0' && key <= '9') ? key - '0' : -1; }
+
+ private:
+  std::array<char, T65_MAX_NUMBER_LENGTH + 1> keys_{};
+  size_t length_{0};
+};
+
+// Request for one of the component's two named scheduler timeouts.
+enum class T65TimerRequest : uint8_t { KEEP, START, STOP };
+
+// What the component must do after a T65Dialer input.
+struct T65DialResult {
+  char collected{0};    // Short press added to the number: publish the dial sensor and key event.
+  char long_press{0};   // Key held for the long-press time.
+  char repeat{0};       // Key still held one repeat time after its long press or previous repeat.
+  bool dropped{false};  // The collected key did not fit in the number.
+  T65TimerRequest report_timer{T65TimerRequest::KEEP};
+  T65TimerRequest long_press_timer{T65TimerRequest::KEEP};
+  T65TimerRequest repeat_timer{T65TimerRequest::KEEP};
+};
+
+// Turns accepted presses into the collected number and, when enabled, long
+// presses.
+//
+// Without long press every press is collected immediately, exactly as the
+// rotarydial component collected each dialed digit. With long press a key is
+// classified when it is released (short) or when the long-press time elapses
+// (long), and only short presses are collected; this mirrors a rotary dial,
+// which also reports a digit only once the dial has returned. A number report
+// that is pending while a key is held waits until that key is classified, and
+// a long press never repeats a report that has already been made.
+//
+// With repeat enabled, a key still held after its long press repeats every
+// repeat time until it is released or joined by another key. Repeats, like
+// long presses, are never collected.
+class T65Dialer {
+ public:
+  void set_long_press_enabled(bool enabled) { this->long_press_enabled_ = enabled; }
+  bool long_press_enabled() const { return this->long_press_enabled_; }
+  void set_repeat_enabled(bool enabled) { this->repeat_enabled_ = enabled; }
+  bool repeat_enabled() const { return this->repeat_enabled_; }
+
+  T65DialResult press(char key) {
+    T65DialResult result;
+    if (!this->long_press_enabled_) {
+      this->collect_(key, result);
+      return result;
+    }
+    this->held_ = key;
+    this->long_possible_ = true;
+    this->long_pressed_ = false;
+    this->repeating_ = false;
+    result.long_press_timer = T65TimerRequest::START;
+    if (this->report_pending_)
+      result.report_timer = T65TimerRequest::STOP;
+    return result;
+  }
+
+  // The held key was joined by other contacts, so it can no longer become a
+  // long press or keep repeating. If it had not become a long press yet, its
+  // release still counts as a short press, just as the press would have been
+  // collected immediately without long press.
+  T65DialResult lockout() {
+    T65DialResult result;
+    if (this->long_possible_) {
+      this->long_possible_ = false;
+      result.long_press_timer = T65TimerRequest::STOP;
+    }
+    if (this->repeating_) {
+      this->repeating_ = false;
+      result.repeat_timer = T65TimerRequest::STOP;
+    }
+    return result;
+  }
+
+  T65DialResult long_press_elapsed() {
+    T65DialResult result;
+    if (!this->long_possible_)
+      return result;
+    this->long_possible_ = false;
+    this->long_pressed_ = true;
+    result.long_press = this->held_;
+    if (this->report_pending_)
+      result.report_timer = T65TimerRequest::START;
+    if (this->repeat_enabled_) {
+      this->repeating_ = true;
+      result.repeat_timer = T65TimerRequest::START;
+    }
+    return result;
+  }
+
+  T65DialResult repeat_elapsed() {
+    T65DialResult result;
+    if (!this->repeating_)
+      return result;
+    result.repeat = this->held_;
+    result.repeat_timer = T65TimerRequest::START;
+    return result;
+  }
+
+  T65DialResult release(char key) {
+    T65DialResult result;
+    if (!this->long_press_enabled_ || this->held_ == 0)
+      return result;
+    if (this->long_possible_)
+      result.long_press_timer = T65TimerRequest::STOP;
+    if (this->repeating_)
+      result.repeat_timer = T65TimerRequest::STOP;
+    if (!this->long_pressed_)
+      this->collect_(key, result);
+    this->held_ = 0;
+    this->long_possible_ = false;
+    this->long_pressed_ = false;
+    this->repeating_ = false;
+    return result;
+  }
+
+  // The report timeout fired and on_numbers has run.
+  void reported() { this->report_pending_ = false; }
+
+  T65DialResult clear() {
+    T65DialResult result;
+    this->number_.clear();
+    this->report_pending_ = false;
+    result.report_timer = T65TimerRequest::STOP;
+    return result;
+  }
+
+  const T65NumberBuffer &number() const { return this->number_; }
+  bool report_pending() const { return this->report_pending_; }
+
+ private:
+  void collect_(char key, T65DialResult &result) {
+    result.collected = key;
+    result.dropped = !this->number_.append(key);
+    result.report_timer = T65TimerRequest::START;
+    this->report_pending_ = true;
+  }
+
+  T65NumberBuffer number_{};
+  bool long_press_enabled_{false};
+  bool repeat_enabled_{false};
+  bool report_pending_{false};
+  char held_{0};
+  bool long_possible_{false};
+  bool long_pressed_{false};
+  bool repeating_{false};
+};
 
 enum class T65State : uint8_t { IDLE, DEBOUNCING, PRESSED, LOCKOUT };
 

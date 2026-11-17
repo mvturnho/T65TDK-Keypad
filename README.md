@@ -29,6 +29,11 @@ internal pull-ups.
 
 No DTMF decoder, external supply, periodic scan task or ESPHome patch is needed.
 
+The keypad is also a drop-in replacement for the `rotarydial` component used in
+converted PTT T65 rotary telephones: it collects dialed numbers and offers the
+same dial sensor, `on_numbers` automation and clear action. See
+[rotary dial compatibility](#rotary-dial-compatibility).
+
 ## Wiring
 
 | T65 pin | Contact | ESP32 example |
@@ -113,7 +118,9 @@ event:
     name: T65 Keypad
 ```
 
-It exposes `key_0` through `key_9`, `key_star`, and `key_hash`. This is a native,
+It exposes `key_0` through `key_9`, `key_star`, and `key_hash`, plus `_long`
+and `_repeat` variants of each when [long press and repeat](#long-press-and-repeat)
+are enabled. This is a native,
 stateless Home Assistant **Event entity**. It is not a custom event fired on the
 Home Assistant event bus. Automations normally watch the entity's state change
 and inspect its `event_type` attribute. See the complete
@@ -122,6 +129,69 @@ and inspect its `event_type` attribute. See the complete
 
 The entity is optional. `on_key` continues to work when Home Assistant is
 offline, and event publication never participates in the ISR.
+
+## Rotary dial compatibility
+
+The keypad collects pressed keys into a number, the way the `rotarydial`
+component collects dialed digits:
+
+```yaml
+t65_keypad:
+  id: t65
+  rows: [GPIO19, GPIO21, GPIO22, GPIO23]
+  columns: [GPIO16, GPIO17, GPIO18]
+  timeout: 3s
+  on_numbers:
+    - lambda: |-
+        ESP_LOGI("t65", "Number: %s", x.c_str());
+
+sensor:
+  - platform: t65_keypad
+    keypad_id: t65
+    name: T65 Dial
+```
+
+`on_numbers` runs once no key has been pressed for `timeout` (default `3s`).
+`x` is a `std::string` with every key since the last clear, such as
+`0612345678` or `*21#`. Keys keep accumulating after the report until the
+`t65_keypad.clear_numbers` action runs, normally on hang-up. The optional
+sensor publishes each digit `0`-`9` as it is pressed, like the rotary dial
+sensor.
+
+To move an existing rotary dial configuration to the keypad without changing
+Home Assistant, follow the [migration guide](docs/rotary_dial_migration.md) or
+start from [rotary_dial_replacement.yaml](examples/rotary_dial_replacement.yaml).
+
+## Long press and repeat
+
+Long press and repeat are opt-in:
+
+```yaml
+t65_keypad:
+  # ...
+  long_press_time: 1s
+  on_key_long_press:
+    - lambda: |-
+        ESP_LOGI("t65", "Long press: %c", x);
+  repeat_time: 250ms
+  on_key_repeat:
+    - lambda: |-
+        ESP_LOGI("t65", "Repeat: %c", x);
+```
+
+A key held for `long_press_time` runs `on_key_long_press` once, while it is
+still held, and the Event entity reports `key_<key>_long`. Long presses are
+left out of the collected number and the dial sensor; short presses are
+collected when they are released. Normal dialing therefore reaches
+`on_numbers` and the dial sensor exactly as it does with a rotary dial.
+`on_key` and `on_key_release` still run for every press. Without
+`long_press_time` nothing changes.
+
+With `repeat_time`, a key that stays held after its long press runs
+`on_key_repeat` every `repeat_time`, and the Event entity reports
+`key_<key>_repeat`, until the key is released. Repeats are not collected
+either. See [long press](docs/configuration.md#long-press) and
+[repeat](docs/configuration.md#repeat) for the details.
 
 ## Runtime behavior
 
@@ -154,10 +224,17 @@ The repository contains:
 
 - native C++ tests for all 12 mappings, partial contacts, delayed closure,
   press/release bounce, hold, re-press, invalid combinations, second-key
-  lockout, boot-held suppression, timer wrap and the loop-disable wake check;
-- real ESPHome schema tests for valid/eventless/event configurations and
-  invalid counts, duplicates, GPIO capabilities, modes and debounce values;
-- GitHub Actions builds for ESP32 ESP-IDF, ESP32-S3 ESP-IDF and ESP32 Arduino.
+  lockout, boot-held suppression, timer wrap, the loop-disable wake check,
+  number collection, clearing and its length limit, short/long press
+  classification including paused and non-repeated number reports, and
+  repeat start, stop and lockout;
+- real ESPHome schema tests for valid/eventless/event configurations, the
+  rotary dial, long press and repeat features, and invalid counts,
+  duplicates, GPIO capabilities, modes, debounce, timeout, long-press and
+  repeat values and option dependencies, plus a code-generation check of the
+  advertised long-press and repeat event types;
+- GitHub Actions builds for ESP32 ESP-IDF, ESP32-S3 ESP-IDF, ESP32 Arduino and
+  the rotary dial replacement example.
 
 Software tests cannot verify contact quality, the measured physical pinout,
 electrical isolation, ISR behavior under real hardware noise, or the exact GPIO

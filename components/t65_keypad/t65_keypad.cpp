@@ -8,10 +8,28 @@
 namespace esphome::t65_keypad {
 
 static const char *const TAG = "t65_keypad";
+static const char *const NUMBER_TIMEOUT_NAME = "numbers";
+static const char *const LONG_PRESS_TIMEOUT_NAME = "long_press";
+static const char *const REPEAT_TIMEOUT_NAME = "repeat";
 
 #ifdef USE_T65_KEYPAD_EVENT
+// Both tables follow the order of T65_KEYS.
 static const char *const EVENT_TYPES[] = {"key_1", "key_2", "key_3", "key_4",    "key_5", "key_6",
                                           "key_7", "key_8", "key_9", "key_star", "key_0", "key_hash"};
+static const char *const LONG_EVENT_TYPES[] = {"key_1_long", "key_2_long",    "key_3_long", "key_4_long",
+                                               "key_5_long", "key_6_long",    "key_7_long", "key_8_long",
+                                               "key_9_long", "key_star_long", "key_0_long", "key_hash_long"};
+static const char *const REPEAT_EVENT_TYPES[] = {"key_1_repeat", "key_2_repeat",    "key_3_repeat", "key_4_repeat",
+                                                 "key_5_repeat", "key_6_repeat",    "key_7_repeat", "key_8_repeat",
+                                                 "key_9_repeat", "key_star_repeat", "key_0_repeat", "key_hash_repeat"};
+
+static int key_index(char key) {
+  for (size_t i = 0; i < sizeof(T65_KEYS) - 1; i++) {
+    if (T65_KEYS[i] == key)
+      return static_cast<int>(i);
+  }
+  return -1;
+}
 #endif
 
 void IRAM_ATTR T65InterruptStore::gpio_intr(T65InterruptStore *arg) {
@@ -86,31 +104,105 @@ T65ContactSample T65Keypad::read_contacts_() const {
 }
 
 void T65Keypad::process_transition_(const T65Transition &transition) {
+  if (transition.entered_lockout)
+    this->apply_(this->dialer_.lockout());
+
   if (transition.pressed != 0) {
     ESP_LOGI(TAG, "Key pressed: %c", transition.pressed);
+    // Apply first so on_key lambdas already see a collected key in get_numbers().
+    this->apply_(this->dialer_.press(transition.pressed));
     for (auto *trigger : this->key_triggers_)
       trigger->trigger(transition.pressed);
-
-#ifdef USE_T65_KEYPAD_EVENT
-    if (this->event_ != nullptr) {
-      const char *event_type = nullptr;
-      for (size_t i = 0; i < sizeof(T65_KEYS) - 1; i++) {
-        if (T65_KEYS[i] == transition.pressed) {
-          event_type = EVENT_TYPES[i];
-          break;
-        }
-      }
-      if (event_type != nullptr)
-        this->event_->trigger(event_type);
-    }
-#endif
   }
 
   if (transition.released != 0) {
     ESP_LOGI(TAG, "Key released: %c", transition.released);
+    this->apply_(this->dialer_.release(transition.released));
     for (auto *trigger : this->key_release_triggers_)
       trigger->trigger(transition.released);
   }
+}
+
+void T65Keypad::apply_(const T65DialResult &result) {
+  // Timers first: the automations below may call clear_numbers(), whose
+  // cancellation must win over a report started by this same result.
+  // Both waits use the ESPHome scheduler, which runs timeouts while this
+  // component's loop is disabled, so a held key or a pending number does not
+  // re-enable polling. Starting a named timeout replaces a running one.
+  if (result.report_timer == T65TimerRequest::START) {
+    this->set_timeout(NUMBER_TIMEOUT_NAME, this->number_timeout_ms_, [this]() {
+      this->dialer_.reported();
+      this->report_numbers_();
+    });
+  } else if (result.report_timer == T65TimerRequest::STOP) {
+    this->cancel_timeout(NUMBER_TIMEOUT_NAME);
+  }
+
+  if (result.long_press_timer == T65TimerRequest::START) {
+    this->set_timeout(LONG_PRESS_TIMEOUT_NAME, this->long_press_ms_,
+                      [this]() { this->apply_(this->dialer_.long_press_elapsed()); });
+  } else if (result.long_press_timer == T65TimerRequest::STOP) {
+    this->cancel_timeout(LONG_PRESS_TIMEOUT_NAME);
+  }
+
+  // A timeout re-armed after every repeat, rather than set_interval(), whose
+  // first run is randomly offset by the scheduler.
+  if (result.repeat_timer == T65TimerRequest::START) {
+    this->set_timeout(REPEAT_TIMEOUT_NAME, this->repeat_ms_, [this]() { this->apply_(this->dialer_.repeat_elapsed()); });
+  } else if (result.repeat_timer == T65TimerRequest::STOP) {
+    this->cancel_timeout(REPEAT_TIMEOUT_NAME);
+  }
+
+  if (result.collected != 0) {
+    if (result.dropped) {
+      ESP_LOGW(TAG, "Number is full (%u keys); key %c dropped. Use t65_keypad.clear_numbers to start a new number",
+               static_cast<unsigned>(T65_MAX_NUMBER_LENGTH), result.collected);
+    }
+#ifdef USE_T65_KEYPAD_SENSOR
+    const int digit = T65NumberBuffer::digit_value(result.collected);
+    if (this->digit_sensor_ != nullptr && digit >= 0)
+      this->digit_sensor_->publish_state(static_cast<float>(digit));
+#endif
+#ifdef USE_T65_KEYPAD_EVENT
+    const int index = key_index(result.collected);
+    if (this->event_ != nullptr && index >= 0)
+      this->event_->trigger(EVENT_TYPES[index]);
+#endif
+  }
+
+  if (result.long_press != 0) {
+    ESP_LOGI(TAG, "Key long press: %c", result.long_press);
+    for (auto *trigger : this->key_long_press_triggers_)
+      trigger->trigger(result.long_press);
+#ifdef USE_T65_KEYPAD_EVENT
+    const int index = key_index(result.long_press);
+    if (this->event_ != nullptr && index >= 0)
+      this->event_->trigger(LONG_EVENT_TYPES[index]);
+#endif
+  }
+
+  if (result.repeat != 0) {
+    ESP_LOGD(TAG, "Key repeat: %c", result.repeat);
+    for (auto *trigger : this->key_repeat_triggers_)
+      trigger->trigger(result.repeat);
+#ifdef USE_T65_KEYPAD_EVENT
+    const int index = key_index(result.repeat);
+    if (this->event_ != nullptr && index >= 0)
+      this->event_->trigger(REPEAT_EVENT_TYPES[index]);
+#endif
+  }
+}
+
+void T65Keypad::report_numbers_() {
+  const std::string numbers = this->dialer_.number().c_str();
+  ESP_LOGI(TAG, "Numbers: %s", numbers.c_str());
+  for (auto *trigger : this->numbers_triggers_)
+    trigger->trigger(numbers);
+}
+
+void T65Keypad::clear_numbers() {
+  this->apply_(this->dialer_.clear());
+  ESP_LOGD(TAG, "Numbers cleared");
 }
 
 void T65Keypad::log_stable_state_(const T65Transition &transition) const {
@@ -150,12 +242,26 @@ void T65Keypad::dump_config() {
   for (auto *pin : this->columns_)
     LOG_PIN("    ", pin);
   ESP_LOGCONFIG(TAG, "  Debounce: %" PRIu32 " ms", this->debounce_ms_);
+  ESP_LOGCONFIG(TAG, "  Number timeout: %" PRIu32 " ms", this->number_timeout_ms_);
+  if (this->dialer_.long_press_enabled()) {
+    ESP_LOGCONFIG(TAG, "  Long press: %" PRIu32 " ms", this->long_press_ms_);
+  } else {
+    ESP_LOGCONFIG(TAG, "  Long press: disabled");
+  }
+  if (this->dialer_.repeat_enabled()) {
+    ESP_LOGCONFIG(TAG, "  Repeat: %" PRIu32 " ms", this->repeat_ms_);
+  } else {
+    ESP_LOGCONFIG(TAG, "  Repeat: disabled");
+  }
   ESP_LOGCONFIG(TAG, "  Input mode: interrupt-driven, active-low with internal pull-ups");
   ESP_LOGCONFIG(TAG, "  Idle polling: disabled");
 #ifdef USE_T65_KEYPAD_EVENT
   ESP_LOGCONFIG(TAG, "  Event entity: %s", this->event_ != nullptr ? "configured" : "not configured");
 #else
   ESP_LOGCONFIG(TAG, "  Event entity: not configured");
+#endif
+#ifdef USE_T65_KEYPAD_SENSOR
+  LOG_SENSOR("  ", "Digit sensor", this->digit_sensor_);
 #endif
 }
 

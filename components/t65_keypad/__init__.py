@@ -10,6 +10,7 @@ from esphome.const import (
     CONF_ON_KEY,
     CONF_OUTPUT,
     CONF_PULLUP,
+    CONF_TIMEOUT,
     CONF_TRIGGER_ID,
 )
 from esphome.types import ConfigType
@@ -21,9 +22,22 @@ CONF_ROWS = "rows"
 CONF_COLUMNS = "columns"
 CONF_DEBOUNCE = "debounce"
 CONF_ON_KEY_RELEASE = "on_key_release"
+CONF_ON_KEY_LONG_PRESS = "on_key_long_press"
+CONF_LONG_PRESS_TIME = "long_press_time"
+CONF_ON_KEY_REPEAT = "on_key_repeat"
+CONF_REPEAT_TIME = "repeat_time"
+CONF_ON_NUMBERS = "on_numbers"
+CONF_KEYPAD_ID = "keypad_id"
 
 MIN_DEBOUNCE_MS = 1
 MAX_DEBOUNCE_MS = 500
+# The lower bound catches typos such as "3ms" for "3s".
+MIN_TIMEOUT_MS = 100
+MAX_TIMEOUT_MS = 60_000
+MIN_LONG_PRESS_MS = 300
+MAX_LONG_PRESS_MS = 10_000
+MIN_REPEAT_MS = 100
+MAX_REPEAT_MS = 10_000
 
 t65_keypad_ns = cg.esphome_ns.namespace("t65_keypad")
 T65Keypad = t65_keypad_ns.class_("T65Keypad", cg.Component)
@@ -32,6 +46,18 @@ T65KeyTrigger = t65_keypad_ns.class_(
 )
 T65KeyReleaseTrigger = t65_keypad_ns.class_(
     "T65KeyReleaseTrigger", automation.Trigger.template(cg.char)
+)
+T65KeyLongPressTrigger = t65_keypad_ns.class_(
+    "T65KeyLongPressTrigger", automation.Trigger.template(cg.char)
+)
+T65KeyRepeatTrigger = t65_keypad_ns.class_(
+    "T65KeyRepeatTrigger", automation.Trigger.template(cg.char)
+)
+T65NumbersTrigger = t65_keypad_ns.class_(
+    "T65NumbersTrigger", automation.Trigger.template(cg.std_string)
+)
+T65ClearNumbersAction = t65_keypad_ns.class_(
+    "T65ClearNumbersAction", automation.Action, cg.Parented.template(T65Keypad)
 )
 
 
@@ -43,6 +69,51 @@ def _validate_debounce(value):
             f"{MAX_DEBOUNCE_MS}ms"
         )
     return value
+
+
+def _validate_timeout(value):
+    value = cv.positive_time_period_milliseconds(value)
+    if not MIN_TIMEOUT_MS <= value.total_milliseconds <= MAX_TIMEOUT_MS:
+        raise cv.Invalid(
+            f"timeout must be between {MIN_TIMEOUT_MS}ms and {MAX_TIMEOUT_MS // 1000}s"
+        )
+    return value
+
+
+def _validate_long_press_time(value):
+    value = cv.positive_time_period_milliseconds(value)
+    if not MIN_LONG_PRESS_MS <= value.total_milliseconds <= MAX_LONG_PRESS_MS:
+        raise cv.Invalid(
+            f"long_press_time must be between {MIN_LONG_PRESS_MS}ms and "
+            f"{MAX_LONG_PRESS_MS // 1000}s"
+        )
+    return value
+
+
+def _validate_repeat_time(value):
+    value = cv.positive_time_period_milliseconds(value)
+    if not MIN_REPEAT_MS <= value.total_milliseconds <= MAX_REPEAT_MS:
+        raise cv.Invalid(
+            f"repeat_time must be between {MIN_REPEAT_MS}ms and {MAX_REPEAT_MS // 1000}s"
+        )
+    return value
+
+
+# Each option on the left needs the option on the right. Long press changes
+# when short presses are collected, so it is enabled only by an explicit
+# long_press_time, never implicitly by a trigger; repeats follow a long press.
+_REQUIRED_OPTIONS = (
+    (CONF_ON_KEY_LONG_PRESS, CONF_LONG_PRESS_TIME),
+    (CONF_REPEAT_TIME, CONF_LONG_PRESS_TIME),
+    (CONF_ON_KEY_REPEAT, CONF_REPEAT_TIME),
+)
+
+
+def _validate_long_press(config: ConfigType) -> ConfigType:
+    for option, required in _REQUIRED_OPTIONS:
+        if option in config and required not in config:
+            raise cv.Invalid(f"{option} requires {required}", path=[option])
+    return config
 
 
 def _validate_pin_mode(pin: ConfigType) -> ConfigType:
@@ -102,10 +173,42 @@ CONFIG_SCHEMA = cv.All(
                     ),
                 }
             ),
+            cv.Optional(CONF_LONG_PRESS_TIME): _validate_long_press_time,
+            cv.Optional(CONF_ON_KEY_LONG_PRESS): automation.validate_automation(
+                {
+                    cv.GenerateID(CONF_TRIGGER_ID): cv.declare_id(
+                        T65KeyLongPressTrigger
+                    ),
+                }
+            ),
+            cv.Optional(CONF_REPEAT_TIME): _validate_repeat_time,
+            cv.Optional(CONF_ON_KEY_REPEAT): automation.validate_automation(
+                {
+                    cv.GenerateID(CONF_TRIGGER_ID): cv.declare_id(T65KeyRepeatTrigger),
+                }
+            ),
+            cv.Optional(CONF_TIMEOUT, default="3s"): _validate_timeout,
+            cv.Optional(CONF_ON_NUMBERS): automation.validate_automation(
+                {
+                    cv.GenerateID(CONF_TRIGGER_ID): cv.declare_id(T65NumbersTrigger),
+                }
+            ),
         }
     ),
     _validate_unique_pins,
+    _validate_long_press,
     cv.only_on_esp32,
+)
+
+automation.register_parented_action(
+    "t65_keypad.clear_numbers",
+    T65ClearNumbersAction,
+    automation.maybe_simple_id(
+        {
+            cv.GenerateID(): cv.use_id(T65Keypad),
+        }
+    ),
+    synchronous=True,
 )
 
 
@@ -118,6 +221,11 @@ async def to_code(config: ConfigType) -> None:
     cg.add(var.set_rows(rows))
     cg.add(var.set_columns(columns))
     cg.add(var.set_debounce(config[CONF_DEBOUNCE]))
+    cg.add(var.set_number_timeout(config[CONF_TIMEOUT]))
+    if CONF_LONG_PRESS_TIME in config:
+        cg.add(var.set_long_press_time(config[CONF_LONG_PRESS_TIME]))
+    if CONF_REPEAT_TIME in config:
+        cg.add(var.set_repeat_time(config[CONF_REPEAT_TIME]))
 
     for conf in config.get(CONF_ON_KEY, []):
         trigger = cg.new_Pvariable(conf[CONF_TRIGGER_ID])
@@ -128,3 +236,18 @@ async def to_code(config: ConfigType) -> None:
         trigger = cg.new_Pvariable(conf[CONF_TRIGGER_ID])
         cg.add(var.register_key_release_trigger(trigger))
         await automation.build_automation(trigger, [(cg.char, "x")], conf)
+
+    for conf in config.get(CONF_ON_KEY_LONG_PRESS, []):
+        trigger = cg.new_Pvariable(conf[CONF_TRIGGER_ID])
+        cg.add(var.register_key_long_press_trigger(trigger))
+        await automation.build_automation(trigger, [(cg.char, "x")], conf)
+
+    for conf in config.get(CONF_ON_KEY_REPEAT, []):
+        trigger = cg.new_Pvariable(conf[CONF_TRIGGER_ID])
+        cg.add(var.register_key_repeat_trigger(trigger))
+        await automation.build_automation(trigger, [(cg.char, "x")], conf)
+
+    for conf in config.get(CONF_ON_NUMBERS, []):
+        trigger = cg.new_Pvariable(conf[CONF_TRIGGER_ID])
+        cg.add(var.register_numbers_trigger(trigger))
+        await automation.build_automation(trigger, [(cg.std_string, "x")], conf)
